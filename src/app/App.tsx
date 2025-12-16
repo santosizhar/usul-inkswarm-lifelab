@@ -3,8 +3,7 @@ import { OverlayHud } from "../ui/OverlayHud";
 import { clamp } from "../ui/utils";
 import { FailScreen } from "./FailScreen";
 import { configureCanvas, initWebGPU } from "../gpu/webgpu";
-import { createRenderer, renderFrame } from "../gpu/renderer";
-
+import { createLifelabSim, type LifelabSim } from "../gpu/lifelab/sim";
 type GpuState =
   | { kind: "booting" }
   | { kind: "ready"; detail: string }
@@ -15,10 +14,12 @@ export function App() {
   const dpiRef = useRef<number>(1);
 
   const [dpiScale, setDpiScale] = useState<number>(1);
+  const [simHud, setSimHud] = useState<string>("");
   const [gpu, setGpu] = useState<GpuState>({ kind: "booting" });
 
   useEffect(() => {
     let raf = 0;
+    let sim: LifelabSim | null = null;
     let alive = true;
 
     async function boot() {
@@ -48,7 +49,8 @@ export function App() {
           });
         });
 
-        const renderer = createRenderer({ device, context, format });
+        sim = createLifelabSim({ device, context, format, canvas });
+        const lastHudRef = { t: 0 };
 
         setGpu({ kind: "ready", detail: "WebGPU initialized" });
 
@@ -60,9 +62,12 @@ export function App() {
             dpiRef.current = dpr;
             setDpiScale(dpr);
           }
-
-          renderFrame(renderer);
-          raf = requestAnimationFrame(tick);
+          const { hud } = sim!.stepAndRender(performance.now());
+          if (performance.now() - lastHudRef.t > 250) {
+            lastHudRef.t = performance.now();
+            setSimHud(hud);
+          }
+raf = requestAnimationFrame(tick);
         };
 
         raf = requestAnimationFrame(tick);
@@ -81,7 +86,8 @@ export function App() {
 
     return () => {
       alive = false;
-      cancelAnimationFrame(raf);
+      if (raf) cancelAnimationFrame(raf);
+      try { sim?.destroy(); } catch {}
     };
   }, []);
 
@@ -93,14 +99,14 @@ export function App() {
           ? "WebGPU ready"
           : "WebGPU failed";
 
-    const mode = gpu.kind === "ready" ? "Placeholder render loop" : "Hard fail";
+    const mode = gpu.kind === "ready" ? "Seeded sim (WebGPU compute + render)" : "Hard fail";
 
     return {
       title: "Inkswarm LifeLab",
-      status: `${status} · DPR ${clamp(dpiScale, 1, 3).toFixed(2)}`,
+      status: `${status} · DPR ${clamp(dpiScale, 1, 3).toFixed(2)}${gpu.kind === "ready" && simHud ? " · " + simHud : ""}`,
       mode,
     };
-  }, [dpiScale, gpu.kind]);
+  }, [dpiScale, gpu.kind, simHud]);
 
   return (
     <div className="app-root">

@@ -21,7 +21,7 @@ export function OverlayHud({ info }: { info: HudInfo }) {
         <div className="hud-divider" />
 
         <div className="hud-hint">
-          WebGPU boot is implemented (D-0002). Next: D-0003 introduces compute buffers and ping-pong simulation passes.
+          D-0004 is now live: seeded particle simulation with a spatial grid + toroidal wrap. Next: ink trails (D-0005) and glow (D-0006).
         </div>
       </div>
     </div>
