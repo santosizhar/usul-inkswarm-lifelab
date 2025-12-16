@@ -215,3 +215,48 @@ html, body, #root {
 .hud-pill:active {
   transform: translateY(1px);
 }
+
+
+/* --- D-0007/D-0008 HUD controls + diagnostics --- */
+.hud-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.hud-btn {
+  font-size: 12px;
+  line-height: 1;
+  padding: 7px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.14);
+  background: rgba(255,255,255,0.04);
+  color: rgba(255,255,255,0.92);
+  cursor: pointer;
+}
+
+.hud-btn:hover {
+  background: rgba(255,255,255,0.08);
+  border-color: rgba(255,255,255,0.22);
+}
+
+.hud-btn--active {
+  background: rgba(255,255,255,0.16);
+  border-color: rgba(255,255,255,0.30);
+}
+
+.hud-btn:active {
+  transform: translateY(1px);
+}
+
+.hud-diag {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.35;
+  opacity: 0.92;
+}
+
+.hud-diag-line {
+  white-space: pre;
+}

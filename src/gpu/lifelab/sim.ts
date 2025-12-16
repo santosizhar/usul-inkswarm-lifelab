@@ -2,8 +2,38 @@ import { LIFELAB_WGSL } from "./wgsl";
 
 export type LifelabPresetInfo = { id: number; name: string };
 
+export type LifelabStats = {
+  presetId: number;
+  presetName: string;
+  profile: "hero" | "stress";
+  particles: number;
+  species: number;
+  res: { w: number; h: number };
+  dt: number;
+  fpsHint?: number;
+  cpuMs: {
+    params: number;
+    compute: number;
+    trails: number;
+    glow: number;
+    present: number;
+    capture: number;
+    submit: number;
+    total: number;
+  };
+};
+
+export type LifelabCapture = {
+  w: number;
+  h: number;
+  rgba: Uint8ClampedArray;
+};
+
 export type LifelabSim = {
-  stepAndRender: (nowMs: number) => { hud: string };
+  stepAndRender: (nowMs: number) => { hud: string; stats: LifelabStats };
+  requestCapture: () => Promise<LifelabCapture>;
+  setProfile: (p: "hero" | "stress") => void;
+  getProfile: () => "hero" | "stress";
   setPreset: (presetId: number) => void;
   getPresets: () => LifelabPresetInfo[];
   getPreset: () => number;
@@ -243,7 +273,12 @@ export function createLifelabSim(args: {
 }): LifelabSim {
   const { device, context, format, canvas } = args;
   const seed = args.seed ?? 1337;
-  const numParticles = args.numParticles ?? 30_000;
+  const heroParticles = args.numParticles ?? 30_000;
+  const stressParticles = Math.max(heroParticles * 2, 80_000);
+  const maxParticles = Math.max(heroParticles, stressParticles);
+  let activeParticles = heroParticles;
+  let profile: "hero" | "stress" = "hero";
+
   const speciesCount = Math.max(2, Math.min(MAX_SPECIES, args.speciesCount ?? 6));
 
   const gridDim = 128;
@@ -256,7 +291,7 @@ export function createLifelabSim(args: {
 
   // --- Buffers ---
   const particleStride = 32;
-  const particleBytes = numParticles * particleStride;
+  const particleBytes = maxParticles * particleStride;
 
   const particlesA = device.createBuffer({
     size: particleBytes,
@@ -300,8 +335,8 @@ export function createLifelabSim(args: {
   });
 
   // Seed initial data (D-0003)
-  device.queue.writeBuffer(particlesA, 0, seedParticles(numParticles, speciesCount, seed));
-  device.queue.writeBuffer(particlesB, 0, seedParticles(numParticles, speciesCount, seed ^ 0xa5a5a5a5));
+  device.queue.writeBuffer(particlesA, 0, seedParticles(maxParticles, speciesCount, seed ^ 0xC0FFEE));
+  device.queue.writeBuffer(particlesB, 0, seedParticles(maxParticles, speciesCount, (seed ^ 0xa5a5a5a5) ^ 0xBADC0DE));
 
   // ---- Bind group layouts (note: WGSL uses groups 0 (sim), 1 (particles render), 2 (post)) ----
   const simBGL = device.createBindGroupLayout({
@@ -489,6 +524,7 @@ export function createLifelabSim(args: {
 
     // Clear both trail targets once to avoid undefined contents
     const encoder = device.createCommandEncoder();
+
     for (const t of [trailA, trailB]) {
       const pass = encoder.beginRenderPass({
         colorAttachments: [
@@ -539,7 +575,58 @@ export function createLifelabSim(args: {
   let pingAB = true;
   let lastMs = 0;
   let timeS = 0;
+  let paramsLastDt = 0;
   let presetId = 0;
+
+  // D-0008: profile switching (hero/stress)
+  let clearTrailsNext = false;
+
+  // D-0007: screenshot capture (one at a time)
+  type CapturePending = {
+    resolve: (cap: LifelabCapture) => void;
+    reject: (err: any) => void;
+  };
+  let capturePending: CapturePending | null = null;
+  let captureInFlight = false;
+
+  function reseedForProfile(p: "hero" | "stress") {
+    const seedMix = p === "hero" ? 0x11111111 : 0x22222222;
+    device.queue.writeBuffer(
+      particlesA,
+      0,
+      seedParticles(maxParticles, speciesCount, (seed ^ seedMix) >>> 0)
+    );
+    device.queue.writeBuffer(
+      particlesB,
+      0,
+      seedParticles(maxParticles, speciesCount, ((seed ^ 0xa5a5a5a5) ^ seedMix) >>> 0)
+    );
+    pingAB = true;
+    clearTrailsNext = true;
+    lastMs = 0;
+    timeS = 0;
+  }
+
+  function setProfile(p: "hero" | "stress") {
+    profile = p;
+    activeParticles = p === "hero" ? heroParticles : stressParticles;
+    reseedForProfile(p);
+  }
+
+  function getProfile() {
+    return profile;
+  }
+
+  async function requestCapture(): Promise<LifelabCapture> {
+    if (captureInFlight) {
+      // keep it fail-closed but non-fatal: reject additional capture requests until resolved
+      return Promise.reject(new Error("Capture already in progress"));
+    }
+    captureInFlight = true;
+    return new Promise<LifelabCapture>((resolve, reject) => {
+      capturePending = { resolve, reject };
+    });
+  }
 
   // Apply initial preset
   function applyPreset(id: number) {
@@ -583,6 +670,7 @@ export function createLifelabSim(args: {
     lastMs = nowMs;
 
     const dt = Math.max(1 / 240, Math.min(1 / 30, dtMs / 1000));
+    paramsLastDt = dt;
     timeS += dt;
 
     device.queue.writeBuffer(
@@ -593,7 +681,7 @@ export function createLifelabSim(args: {
         resY: targetH,
         time: timeS,
         dt,
-        numParticles,
+        numParticles: activeParticles,
         speciesCount,
         gridDim,
         cellCap,
@@ -602,7 +690,9 @@ export function createLifelabSim(args: {
   }
 
   function stepAndRender(nowMs: number) {
+    const tTotal0 = performance.now();
     updateParams(nowMs);
+    const tParams1 = performance.now();
 
     const simBG = pingAB ? simBG_AB : simBG_BA;
     const rBG = pingAB ? renderBG_B : renderBG_A;
@@ -633,6 +723,25 @@ export function createLifelabSim(args: {
 
     const encoder = device.createCommandEncoder();
 
+    // D-0008: on profile switches, clear trail history once.
+    if (clearTrailsNext) {
+      clearTrailsNext = false;
+      for (const t of [trailA!, trailB!]) {
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [
+            {
+              view: t.createView(),
+              clearValue: { r: 0, g: 0, b: 0, a: 1 },
+              loadOp: "clear",
+              storeOp: "store",
+            },
+          ],
+        });
+        pass.end();
+      }
+      trailPing = true;
+    }
+
     // Compute: clear -> build grid -> simulate
     {
       const pass = encoder.beginComputePass();
@@ -642,13 +751,14 @@ export function createLifelabSim(args: {
       pass.dispatchWorkgroups(Math.ceil(cellCount / 256));
 
       pass.setPipeline(csBuild);
-      pass.dispatchWorkgroups(Math.ceil(numParticles / 256));
+      pass.dispatchWorkgroups(Math.ceil(activeParticles / 256));
 
       pass.setPipeline(csSim);
-      pass.dispatchWorkgroups(Math.ceil(numParticles / 256));
+      pass.dispatchWorkgroups(Math.ceil(activeParticles / 256));
 
       pass.end();
     }
+    const tCompute1 = performance.now();
 
     // D-0005: Trails
     // Pass 1: decay previous trailSrc into trailDst
@@ -684,9 +794,10 @@ export function createLifelabSim(args: {
 
       pass.setPipeline(particlePipeline);
       pass.setBindGroup(1, rBG);
-      pass.draw(numParticles * 6);
+      pass.draw(activeParticles * 6);
       pass.end();
     }
+    const tTrails2 = performance.now();
 
     // D-0006: Glow (downsample + blur) into glowTex
     {
@@ -706,10 +817,12 @@ export function createLifelabSim(args: {
       pass.draw(3);
       pass.end();
     }
+    const tGlow3 = performance.now();
 
     // Present: composite trail + glow to swapchain
     {
-      const view = context.getCurrentTexture().createView();
+      const currentTex = context.getCurrentTexture();
+      const view = currentTex.createView();
       const pass = encoder.beginRenderPass({
         colorAttachments: [
           {
@@ -725,17 +838,117 @@ export function createLifelabSim(args: {
       pass.setBindGroup(2, postBG_forPresent!);
       pass.draw(3);
       pass.end();
+
+      // D-0007: If a capture is pending, copy the swapchain texture to a mapped buffer.
+      if (capturePending) {
+        const w = targetW;
+        const h = targetH;
+        const bytesPerPixel = 4;
+        const unpadded = w * bytesPerPixel;
+        const bytesPerRow = Math.ceil(unpadded / 256) * 256;
+        const size = bytesPerRow * h;
+
+        const readback = device.createBuffer({
+          size,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+
+        encoder.copyTextureToBuffer(
+          { texture: currentTex },
+          { buffer: readback, bytesPerRow, rowsPerImage: h },
+          { width: w, height: h }
+        );
+
+        const pending = capturePending;
+        capturePending = null;
+
+        // Finish+submit now; after submit, map and resolve.
+        const tBeforeSubmit = performance.now();
+        device.queue.submit([encoder.finish()]);
+        const tAfterSubmit = performance.now();
+
+        readback
+          .mapAsync(GPUMapMode.READ)
+          .then(() => {
+            const mapped = new Uint8Array(readback.getMappedRange());
+            const out = new Uint8ClampedArray(w * h * 4);
+            for (let y = 0; y < h; y++) {
+              const srcOff = y * bytesPerRow;
+              const dstOff = y * unpadded;
+              out.set(mapped.subarray(srcOff, srcOff + unpadded), dstOff);
+            }
+            readback.unmap();
+            readback.destroy();
+            captureInFlight = false;
+            pending.resolve({ w, h, rgba: out });
+          })
+          .catch((err) => {
+            try {
+              readback.destroy();
+            } catch {}
+            captureInFlight = false;
+            pending.reject(err);
+          });
+
+        // We returned early; stats for this frame will be computed with capture timing below.
+        const p = PRESETS[presetId] ?? PRESETS[0]!;
+        const hud = `Preset: ${p.name} · Profile ${profile} · Particles ${activeParticles.toLocaleString()} · Species ${speciesCount} · ${targetW}×${targetH}`;
+        const stats: LifelabStats = {
+          presetId,
+          presetName: p.name,
+          profile,
+          particles: activeParticles,
+          species: speciesCount,
+          res: { w: targetW, h: targetH },
+          dt: paramsLastDt,
+          cpuMs: {
+            params: tParams1 - tTotal0,
+            compute: tCompute1 - tParams1,
+            trails: tTrails2 - tCompute1,
+            glow: tGlow3 - tTrails2,
+            present: (tBeforeSubmit - tGlow3),
+            capture: (tAfterSubmit - tBeforeSubmit),
+            submit: 0,
+            total: tAfterSubmit - tTotal0,
+          },
+        };
+        return { hud, stats };
+      }
+
     }
 
+    const tPresent4 = performance.now();
+
     device.queue.submit([encoder.finish()]);
+    const tSubmit5 = performance.now();
 
     // Flip
     pingAB = !pingAB;
     trailPing = !trailPing;
 
     const p = PRESETS[presetId] ?? PRESETS[0]!;
-    const hud = `Preset: ${p.name} · Particles ${numParticles.toLocaleString()} · Species ${speciesCount} · ${targetW}×${targetH}`;
-    return { hud };
+    const hud = `Preset: ${p.name} · Profile ${profile} · Particles ${activeParticles.toLocaleString()} · Species ${speciesCount} · ${targetW}×${targetH}`;
+    const stats: LifelabStats = {
+      presetId,
+      presetName: p.name,
+      profile,
+      particles: activeParticles,
+      species: speciesCount,
+      res: { w: targetW, h: targetH },
+      dt: paramsLastDt,
+      cpuMs: {
+        params: tParams1 - tTotal0,
+        compute: tCompute1 - tParams1,
+        trails: tTrails2 - tCompute1,
+        glow: tGlow3 - tTrails2,
+        present: tPresent4 - tGlow3,
+        capture: 0,
+        submit: tSubmit5 - tPresent4,
+        total: tSubmit5 - tTotal0,
+      },
+    };
+
+    return { hud, stats };
   }
 
   function setPreset(id: number) {
@@ -764,5 +977,5 @@ export function createLifelabSim(args: {
     glowTex?.destroy();
   }
 
-  return { stepAndRender, setPreset, getPresets, getPreset, destroy };
+  return { stepAndRender, requestCapture, setProfile, getProfile, setPreset, getPresets, getPreset, destroy };
 }

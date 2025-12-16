@@ -11,11 +11,24 @@ export function OverlayHud({
   presets,
   presetId,
   onPreset,
+  profile,
+  diagnosticsOn,
+  diagnosticsLines,
+  onProfile,
+  onToggleDiagnostics,
+  onScreenshot,
 }: {
   info: HudInfo;
   presets: PresetInfo[];
   presetId: number;
   onPreset: (id: number) => void;
+
+  profile: "hero" | "stress";
+  diagnosticsOn: boolean;
+  diagnosticsLines: string[];
+  onProfile: (p: "hero" | "stress") => void;
+  onToggleDiagnostics: () => void;
+  onScreenshot: () => void;
 }) {
   return (
     <div className="hud-root" role="presentation">
@@ -34,6 +47,36 @@ export function OverlayHud({
         <div className="hud-divider" />
 
         <div className="hud-row hud-row--stack">
+          <span className="hud-label">Controls</span>
+          <div className="hud-actions" role="group" aria-label="Controls">
+            <button className="hud-btn" type="button" onClick={onScreenshot}>
+              Screenshot (P)
+            </button>
+            <button
+              className={"hud-btn " + (diagnosticsOn ? "hud-btn--active" : "")}
+              type="button"
+              onClick={onToggleDiagnostics}
+            >
+              Diagnostics (D)
+            </button>
+            <button
+              className={"hud-btn " + (profile === "hero" ? "hud-btn--active" : "")}
+              type="button"
+              onClick={() => onProfile("hero")}
+            >
+              Hero (1)
+            </button>
+            <button
+              className={"hud-btn " + (profile === "stress" ? "hud-btn--active" : "")}
+              type="button"
+              onClick={() => onProfile("stress")}
+            >
+              Stress (2)
+            </button>
+          </div>
+        </div>
+
+        <div className="hud-row hud-row--stack">
           <span className="hud-label">Preset</span>
           <div className="hud-presets" role="group" aria-label="Visual presets">
             {presets.map((p) => (
@@ -49,10 +92,23 @@ export function OverlayHud({
           </div>
         </div>
 
+        {diagnosticsOn ? (
+          <>
+            <div className="hud-divider" />
+            <div className="hud-diag" aria-label="Diagnostics overlay">
+              {diagnosticsLines.map((l, i) => (
+                <div key={i} className="hud-diag-line">
+                  {l}
+                </div>
+              ))}
+            </div>
+          </>
+        ) : null}
+
         <div className="hud-divider" />
 
         <div className="hud-hint">
-          D-0006 is live: ink trails + soft glow. Next: screenshot export (D-0007) and diagnostics overlay (D-0008).
+          WebGPU-only. Hotkeys: P screenshot · D diagnostics · 1/2 hero/stress · click presets.
         </div>
       </div>
     </div>

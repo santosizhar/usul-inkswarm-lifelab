@@ -38,6 +38,27 @@ fn wrapPos(p: vec2f) -> vec2f {
   return vec2f(wrap01(p.x), wrap01(p.y));
 }
 
+
+fn isBad(x: f32) -> bool {
+  // NaN check: (x != x) is true only for NaN.
+  return (x != x) || (abs(x) > 1e6);
+}
+
+fn hash_u32(x0: u32) -> u32 {
+  var x = x0;
+  x = x ^ (x >> 16u);
+  x = x * 0x7feb352du;
+  x = x ^ (x >> 15u);
+  x = x * 0x846ca68bu;
+  x = x ^ (x >> 16u);
+  return x;
+}
+
+fn rand01(seed: u32) -> f32 {
+  return f32(hash_u32(seed)) / 4294967296.0;
+}
+
+
 fn toroidalDelta(a: vec2f, b: vec2f) -> vec2f {
   // returns b-a in [-0.5, 0.5] per axis (toroidal shortest vector)
   var d = b - a;
@@ -85,6 +106,15 @@ fn cs_simulate(@builtin(global_invocation_id) gid: vec3u) {
   if (i >= params.numParticles) { return; }
 
   var p = particlesIn[i];
+
+  // D-0008: stability guard — if state blew up, reseed this particle deterministically.
+  if (isBad(p.pos.x) || isBad(p.pos.y) || isBad(p.vel.x) || isBad(p.vel.y)) {
+    let s0 = (i * 2u) ^ u32(params.time * 1000.0);
+    p.pos = vec2f(rand01(s0 + 1u), rand01(s0 + 2u));
+    p.vel = vec2f(0.0, 0.0);
+    p.energy = 0.5;
+    p.size = 3.0;
+  }
 
   // --- Baseline drift (keeps the system alive even if interactions are mild)
   let center = vec2f(0.5, 0.5);
@@ -144,10 +174,17 @@ fn cs_simulate(@builtin(global_invocation_id) gid: vec3u) {
   // mild curl drift (keeps motion coherent even if acc is tiny)
   acc += curl * 0.02;
 
+  // Clamp acceleration to avoid rare grid spikes.
+  let amax = 2.0;
+  let alen = length(acc);
+  if (alen > amax) {
+    acc = acc * (amax / alen);
+  }
+
   p.vel = p.vel + acc * dt;
 
   // stability clamps
-  let vmax = 1.0;
+  let vmax = 0.85 + 0.15 * p.energy;
   let spd = length(p.vel);
   if (spd > vmax) {
     p.vel = p.vel * (vmax / spd);

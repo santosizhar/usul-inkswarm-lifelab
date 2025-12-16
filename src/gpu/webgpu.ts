@@ -67,6 +67,7 @@ export async function initWebGPU(canvas: HTMLCanvasElement): Promise<WebGPUInitO
     device,
     format,
     alphaMode: "premultiplied",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
 
   return { adapter, device, context, format };
@@ -93,6 +94,7 @@ export function configureCanvas(
       device,
       format,
       alphaMode: "premultiplied",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
     });
   }
 
