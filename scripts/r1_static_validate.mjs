@@ -115,8 +115,22 @@ check("No license policy is documented", () => {
 });
 
 check("R1 delivery doc exists", () => {
-  must(exists("docs/R1_DELIVERY.md"), "missing docs/R1_DELIVERY.md");
+  must(exists("docs_src/R1_DELIVERY.md"), "missing docs_src/R1_DELIVERY.md");
 });
+
+check("Authored docs exist (docs_src)", () => {
+  must(exists("docs_src/ARCHITECTURE.md"), "missing docs_src/ARCHITECTURE.md");
+  must(exists("docs_src/GALLERY.md"), "missing docs_src/GALLERY.md");
+  must(exists("docs_src/TROUBLESHOOTING.md"), "missing docs_src/TROUBLESHOOTING.md");
+  must(exists("docs_src/PAGES.md"), "missing docs_src/PAGES.md");
+});
+
+check("Pages build config targets /docs", () => {
+  const vite = readText("vite.config.ts");
+  must(vite.includes('outDir: "docs"') || vite.includes("outDir: 'docs'"), "vite build outDir is not /docs");
+  must(vite.includes('base: "./"') || vite.includes("base: './'"), "vite base is not relative ./");
+});
+
 
 // Output
 const ok = results.every((r) => r.ok);

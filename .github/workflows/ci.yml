@@ -17,13 +17,16 @@ jobs:
           node-version: "20"
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Static R1 validation
         run: npm run validate:r1
 
-      - name: Build
+      - name: Build (Pages output to /docs)
         run: npm run build
+
+      - name: Pages artifact check
+        run: npm run check:pages
 
       - name: Unit tests
         run: npm test
