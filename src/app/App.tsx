@@ -1,100 +1,120 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { OverlayHud } from "../ui/OverlayHud";
 import { clamp } from "../ui/utils";
+import { FailScreen } from "./FailScreen";
+import { configureCanvas, initWebGPU } from "../gpu/webgpu";
+import { createRenderer, renderFrame } from "../gpu/renderer";
 
-/**
- * D-0001: Canvas mount + UI shell.
- * NOTE: WebGPU is introduced in D-0002. Here we render a lightweight placeholder frame
- * using 2D just to confirm sizing + overlay stacking works.
- */
+type GpuState =
+  | { kind: "booting" }
+  | { kind: "ready"; detail: string }
+  | { kind: "failed"; message: string; detail?: string };
+
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const dpiRef = useRef<number>(1);
+
   const [dpiScale, setDpiScale] = useState<number>(1);
+  const [gpu, setGpu] = useState<GpuState>({ kind: "booting" });
+
+  useEffect(() => {
+    let raf = 0;
+    let alive = true;
+
+    async function boot() {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      try {
+        const { device, context, format } = await initWebGPU(canvas);
+
+        device.addEventListener("uncapturederror", (ev) => {
+          const msg =
+            (ev.error && (ev.error as GPUError).message) || "Unknown GPU error";
+          if (!alive) return;
+          setGpu({
+            kind: "failed",
+            message: "A WebGPU error occurred during execution.",
+            detail: msg,
+          });
+        });
+
+        device.lost.then((info) => {
+          if (!alive) return;
+          setGpu({
+            kind: "failed",
+            message: "The WebGPU device was lost.",
+            detail: `${info.reason}: ${info.message}`,
+          });
+        });
+
+        const renderer = createRenderer({ device, context, format });
+
+        setGpu({ kind: "ready", detail: "WebGPU initialized" });
+
+        const tick = () => {
+          if (!alive) return;
+
+          const { dpr } = configureCanvas(canvas, context, device, format);
+          if (Math.abs(dpr - dpiRef.current) > 0.01) {
+            dpiRef.current = dpr;
+            setDpiScale(dpr);
+          }
+
+          renderFrame(renderer);
+          raf = requestAnimationFrame(tick);
+        };
+
+        raf = requestAnimationFrame(tick);
+      } catch (err: any) {
+        if (!alive) return;
+
+        const message =
+          err?.message?.toString?.() || "WebGPU initialization failed.";
+        const detail = err?.detail ? String(err.detail) : String(err);
+
+        setGpu({ kind: "failed", message, detail });
+      }
+    }
+
+    boot();
+
+    return () => {
+      alive = false;
+      cancelAnimationFrame(raf);
+    };
+  }, []);
 
   const info = useMemo(() => {
+    const status =
+      gpu.kind === "booting"
+        ? "Booting…"
+        : gpu.kind === "ready"
+          ? "WebGPU ready"
+          : "WebGPU failed";
+
+    const mode = gpu.kind === "ready" ? "Placeholder render loop" : "Hard fail";
+
     return {
       title: "Inkswarm LifeLab",
-      status: "Scaffold ready (D-0001)",
-      mode: "Start-coding mode",
+      status: `${status} · DPR ${clamp(dpiScale, 1, 3).toFixed(2)}`,
+      mode,
     };
-  }, []);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const handleResize = () => {
-      const dpr = clamp(window.devicePixelRatio || 1, 1, 3);
-      setDpiScale(dpr);
-
-      const rect = canvas.getBoundingClientRect();
-      const w = Math.max(1, Math.floor(rect.width * dpr));
-      const h = Math.max(1, Math.floor(rect.height * dpr));
-      if (canvas.width !== w) canvas.width = w;
-      if (canvas.height !== h) canvas.height = h;
-    };
-
-    handleResize();
-    const ro = new ResizeObserver(handleResize);
-    ro.observe(canvas);
-
-    return () => ro.disconnect();
-  }, []);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    let raf = 0;
-    let t0 = performance.now();
-
-    const tick = (t: number) => {
-      const dt = Math.min(0.05, (t - t0) / 1000);
-      t0 = t;
-
-      // Placeholder: simple animated vignette to verify render loop + sizing.
-      const w = canvas.width;
-      const h = canvas.height;
-
-      ctx.clearRect(0, 0, w, h);
-
-      const g = ctx.createRadialGradient(
-        w * 0.5,
-        h * 0.5,
-        Math.min(w, h) * 0.1,
-        w * 0.5,
-        h * 0.5,
-        Math.min(w, h) * 0.7
-      );
-      const pulse = 0.5 + 0.5 * Math.sin(t * 0.001);
-      g.addColorStop(0, `rgba(25, 25, 35, ${0.95})`);
-      g.addColorStop(1, `rgba(5, 5, 10, ${0.95 - 0.15 * pulse})`);
-      ctx.fillStyle = g;
-      ctx.fillRect(0, 0, w, h);
-
-      // A tiny moving marker (visual sanity check).
-      const x = (0.5 + 0.35 * Math.sin(t * 0.0006)) * w;
-      const y = (0.5 + 0.35 * Math.cos(t * 0.0005)) * h;
-      ctx.fillStyle = "rgba(255,255,255,0.6)";
-      ctx.beginPath();
-      ctx.arc(x, y, 2 * (window.devicePixelRatio || 1), 0, Math.PI * 2);
-      ctx.fill();
-
-      raf = requestAnimationFrame(tick);
-      void dt;
-    };
-
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [dpiScale]);
+  }, [dpiScale, gpu.kind]);
 
   return (
     <div className="app-root">
       <canvas ref={canvasRef} className="sim-canvas" />
       <OverlayHud info={info} />
+      {gpu.kind === "failed" ? (
+        <FailScreen
+          info={{
+            title: "WebGPU Unavailable",
+            message: gpu.message,
+            detail: gpu.detail,
+          }}
+        />
+      ) : null}
     </div>
   );
 }

@@ -21,7 +21,7 @@ export function OverlayHud({ info }: { info: HudInfo }) {
         <div className="hud-divider" />
 
         <div className="hud-hint">
-          D-0002 will initialize WebGPU. If unsupported, we will hard-fail with a polished explanation screen (no fallback sim).
+          WebGPU boot is implemented (D-0002). Next: D-0003 introduces compute buffers and ping-pong simulation passes.
         </div>
       </div>
     </div>
