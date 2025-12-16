@@ -10,7 +10,8 @@
     "test": "vitest run",
     "test:ui": "vitest",
     "test:e2e": "playwright test",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "validate:r1": "node scripts/r1_static_validate.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",
