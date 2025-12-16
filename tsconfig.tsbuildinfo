@@ -1,0 +1,1 @@
+{"root":["./src/main.tsx","./src/vite-env.d.ts","./src/app/App.tsx","./src/app/FailScreen.tsx","./src/gpu/renderer.ts","./src/gpu/webgpu.ts","./src/gpu/lifelab/sim.ts","./src/gpu/lifelab/wgsl.ts","./src/ui/OverlayHud.tsx","./src/ui/utils.ts"],"errors":true,"version":"5.8.3"}

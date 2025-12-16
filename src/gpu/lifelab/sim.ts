@@ -1,12 +1,18 @@
 import { LIFELAB_WGSL } from "./wgsl";
 
+export type LifelabPresetInfo = { id: number; name: string };
+
 export type LifelabSim = {
   stepAndRender: (nowMs: number) => { hud: string };
+  setPreset: (presetId: number) => void;
+  getPresets: () => LifelabPresetInfo[];
+  getPreset: () => number;
   destroy: () => void;
 };
 
 const MAX_SPECIES = 10;
 
+// ---- Packed uniforms ----
 type PackedParams = {
   resX: number;
   resY: number;
@@ -18,64 +24,8 @@ type PackedParams = {
   cellCap: number;
 };
 
-function makePalette(speciesCount: number): Float32Array {
-  // RGBA in linear-ish space; alpha is used in the fragment for soft dots.
-  const colors: number[][] = [
-    [0.85, 0.30, 0.25, 1.0],
-    [0.20, 0.70, 0.45, 1.0],
-    [0.25, 0.45, 0.85, 1.0],
-    [0.90, 0.75, 0.25, 1.0],
-    [0.75, 0.25, 0.85, 1.0],
-    [0.25, 0.85, 0.85, 1.0],
-    [0.85, 0.55, 0.25, 1.0],
-    [0.55, 0.85, 0.25, 1.0],
-    [0.25, 0.55, 0.85, 1.0],
-    [0.85, 0.25, 0.55, 1.0],
-  ];
-
-  const out = new Float32Array(MAX_SPECIES * 4);
-  for (let i = 0; i < MAX_SPECIES; i++) {
-    const c = colors[i % colors.length];
-    out[i * 4 + 0] = c[0];
-    out[i * 4 + 1] = c[1];
-    out[i * 4 + 2] = c[2];
-    out[i * 4 + 3] = i < speciesCount ? c[3] : 0.0;
-  }
-  return out;
-}
-
-function lcg(seed: number) {
-  let s = seed >>> 0;
-  return () => {
-    // Numerical Recipes LCG
-    s = (1664525 * s + 1013904223) >>> 0;
-    return s / 0xffffffff;
-  };
-}
-
-function createInteractionMatrix(seed: number): Float32Array {
-  const rand = lcg(seed ^ 0x9e3779b9);
-  const mat = new Float32Array(MAX_SPECIES * MAX_SPECIES);
-  for (let a = 0; a < MAX_SPECIES; a++) {
-    for (let b = 0; b < MAX_SPECIES; b++) {
-      // Diagonal: mild repulsion (avoid collapse); off-diagonal: mix.
-      const base = a === b ? -0.30 : (rand() * 2 - 1) * 0.45;
-      mat[a * MAX_SPECIES + b] = base;
-    }
-  }
-  return mat;
-}
-
 function packParams(p: PackedParams): ArrayBuffer {
-  // WGSL Params:
-  // res: vec2f (8)
-  // time: f32 (4)
-  // dt: f32 (4)
-  // numParticles: u32 (4)
-  // speciesCount: u32 (4)
-  // gridDim: u32 (4)
-  // cellCap: u32 (4)
-  // Total = 32 bytes
+  // 8 floats/uints packed as 32 bytes
   const buf = new ArrayBuffer(32);
   const dv = new DataView(buf);
   dv.setFloat32(0, p.resX, true);
@@ -89,46 +39,196 @@ function packParams(p: PackedParams): ArrayBuffer {
   return buf;
 }
 
+type PostParams = {
+  resX: number;
+  resY: number;
+  glowResX: number;
+  glowResY: number;
+  trailDecay: number;
+  exposure: number;
+  glowStrength: number;
+};
+
+function packPostParams(p: PostParams): ArrayBuffer {
+  // PostParams struct is 32 bytes:
+  // vec2f res (8) + vec2f glowRes (8) + 4 floats (16) = 32
+  const buf = new ArrayBuffer(32);
+  const dv = new DataView(buf);
+  dv.setFloat32(0, p.resX, true);
+  dv.setFloat32(4, p.resY, true);
+  dv.setFloat32(8, p.glowResX, true);
+  dv.setFloat32(12, p.glowResY, true);
+  dv.setFloat32(16, p.trailDecay, true);
+  dv.setFloat32(20, p.exposure, true);
+  dv.setFloat32(24, p.glowStrength, true);
+  dv.setFloat32(28, 0.0, true);
+  return buf;
+}
+
+// ---- Deterministic RNG helpers ----
+function makeLCG(seed: number) {
+  let s = seed >>> 0;
+  return () => {
+    // LCG constants
+    s = (1664525 * s + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+function createInteractionMatrix(seed: number, presetId: number): Float32Array {
+  const rnd = makeLCG((seed ^ (presetId * 0x9e3779b9)) >>> 0);
+  const m = new Float32Array(MAX_SPECIES * MAX_SPECIES);
+
+  // Curated patterns (still deterministic). Values are small; WGSL integrates and clamps.
+  for (let i = 0; i < MAX_SPECIES; i++) {
+    for (let j = 0; j < MAX_SPECIES; j++) {
+      const idx = i * MAX_SPECIES + j;
+
+      // Base: gentle repulsion to avoid clumping too hard
+      let v = -0.15;
+
+      if (presetId === 0) {
+        // "Ink Vortex": self-attraction + spiral-ish asymmetry
+        v += i === j ? 0.55 : -0.10;
+        v += (i - j) % 3 === 0 ? 0.18 : 0.0;
+      } else if (presetId === 1) {
+        // "Neon Kelp": cyclic attraction chain
+        v += (j === (i + 1) % MAX_SPECIES) ? 0.50 : 0.0;
+        v += (j === (i + MAX_SPECIES - 1) % MAX_SPECIES) ? -0.25 : 0.0;
+      } else if (presetId === 2) {
+        // "Predator Bloom": asymmetric predator/prey blocks
+        const band = (i % 2) - (j % 2);
+        v += band === 1 ? 0.45 : band === -1 ? -0.35 : 0.10;
+      } else if (presetId === 3) {
+        // "Quiet Nebula": mostly calm, small random texture
+        v += (rnd() - 0.5) * 0.18;
+        v += i === j ? 0.20 : -0.05;
+      } else {
+        // "Chaos Inkstorm": random but bounded
+        v = (rnd() * 2 - 1) * 0.55;
+      }
+
+      // Tiny deterministic jitter prevents dead-symmetry
+      v += (rnd() - 0.5) * 0.06;
+
+      m[idx] = v;
+    }
+  }
+
+  return m;
+}
+
+function makePalette(speciesCount: number, presetId: number): Float32Array {
+  // Uniform array<vec4f, 10>
+  const out = new Float32Array(MAX_SPECIES * 4);
+
+  // Simple curated palettes; alpha is also used in particle FS for brightness.
+  const palettes: Array<Array<[number, number, number, number]>> = [
+    // 0: Ink Vortex (cool ink + paper glow)
+    [
+      [0.70, 0.85, 1.00, 0.90],
+      [0.25, 0.55, 0.95, 0.90],
+      [0.55, 0.35, 0.95, 0.90],
+      [0.95, 0.45, 0.55, 0.90],
+      [0.95, 0.85, 0.35, 0.90],
+    ],
+    // 1: Neon Kelp (teals/greens)
+    [
+      [0.20, 1.00, 0.85, 0.90],
+      [0.10, 0.65, 0.95, 0.90],
+      [0.55, 0.95, 0.35, 0.90],
+      [0.85, 1.00, 0.35, 0.90],
+      [0.95, 0.55, 0.35, 0.90],
+    ],
+    // 2: Predator Bloom (magenta/orange)
+    [
+      [1.00, 0.25, 0.85, 0.90],
+      [0.95, 0.35, 0.45, 0.90],
+      [1.00, 0.65, 0.25, 0.90],
+      [0.85, 0.85, 0.30, 0.90],
+      [0.35, 0.95, 0.75, 0.90],
+    ],
+    // 3: Quiet Nebula (soft)
+    [
+      [0.85, 0.85, 0.95, 0.85],
+      [0.65, 0.75, 0.95, 0.85],
+      [0.85, 0.65, 0.95, 0.85],
+      [0.95, 0.75, 0.65, 0.85],
+      [0.75, 0.95, 0.65, 0.85],
+    ],
+    // 4: Chaos Inkstorm (high contrast)
+    [
+      [1.00, 1.00, 1.00, 0.95],
+      [0.95, 0.35, 0.95, 0.95],
+      [0.25, 0.95, 0.95, 0.95],
+      [0.95, 0.95, 0.25, 0.95],
+      [0.95, 0.35, 0.25, 0.95],
+    ],
+  ];
+
+  const palette = palettes[Math.max(0, Math.min(palettes.length - 1, presetId))]!;
+
+  for (let i = 0; i < MAX_SPECIES; i++) {
+    const c = palette[i % palette.length]!;
+    out[i * 4 + 0] = c[0];
+    out[i * 4 + 1] = c[1];
+    out[i * 4 + 2] = c[2];
+    out[i * 4 + 3] = c[3];
+  }
+
+  // If fewer species, keep remaining palette entries harmless (still set, just unused).
+  void speciesCount;
+  return out;
+}
+
 function seedParticles(num: number, speciesCount: number, seed: number): ArrayBuffer {
-  // Particle stride = 32 bytes (see WGSL)
+  // Particle stride = 32 bytes (see WGSL Particle)
   const stride = 32;
   const buf = new ArrayBuffer(num * stride);
   const dv = new DataView(buf);
 
-  const rand = lcg(seed);
+  const rnd = makeLCG(seed);
   for (let i = 0; i < num; i++) {
-    const o = i * stride;
+    const base = i * stride;
 
-    // pos in [0,1], slightly clustered around center
-    const r1 = rand();
-    const r2 = rand();
-    const angle = r1 * Math.PI * 2;
-    const radius = Math.pow(r2, 0.65) * 0.35;
-    const px = 0.5 + Math.cos(angle) * radius;
-    const py = 0.5 + Math.sin(angle) * radius;
+    // position in [0,1]
+    const x = rnd();
+    const y = rnd();
 
-    // vel small random
-    const vx = (rand() * 2 - 1) * 0.15;
-    const vy = (rand() * 2 - 1) * 0.15;
+    // initial velocity (small)
+    const vx = (rnd() * 2 - 1) * 0.05;
+    const vy = (rnd() * 2 - 1) * 0.05;
 
-    const energy = rand() * 0.6;
-    const size = 1.8 + energy * 2.5;
+    const species = Math.floor(rnd() * speciesCount) >>> 0;
 
-    const sp = (Math.floor(rand() * speciesCount) >>> 0) % MAX_SPECIES;
+    // energy in [0.25, 1]
+    const energy = 0.25 + rnd() * 0.75;
 
-    dv.setFloat32(o + 0, px, true);
-    dv.setFloat32(o + 4, py, true);
-    dv.setFloat32(o + 8, vx, true);
-    dv.setFloat32(o + 12, vy, true);
-    dv.setFloat32(o + 16, energy, true);
-    dv.setFloat32(o + 20, size, true);
-    dv.setUint32(o + 24, sp, true);
-    dv.setUint32(o + 28, 0, true);
+    // size in px-ish (5..11) * energy
+    const size = (5 + rnd() * 6) * (0.65 + 0.35 * energy);
+
+    dv.setFloat32(base + 0, x, true);
+    dv.setFloat32(base + 4, y, true);
+    dv.setFloat32(base + 8, vx, true);
+    dv.setFloat32(base + 12, vy, true);
+    dv.setUint32(base + 16, species, true);
+    dv.setFloat32(base + 20, energy, true);
+    dv.setFloat32(base + 24, size, true);
+    dv.setFloat32(base + 28, 0.0, true);
   }
+
   return buf;
 }
 
-function createModule(device: GPUDevice): GPUShaderModule {
+const PRESETS: Array<{ id: number; name: string; trailDecay: number; exposure: number; glowStrength: number }> = [
+  { id: 0, name: "Ink Vortex", trailDecay: 0.945, exposure: 1.10, glowStrength: 0.55 },
+  { id: 1, name: "Neon Kelp", trailDecay: 0.955, exposure: 1.05, glowStrength: 0.65 },
+  { id: 2, name: "Predator Bloom", trailDecay: 0.940, exposure: 1.15, glowStrength: 0.75 },
+  { id: 3, name: "Quiet Nebula", trailDecay: 0.965, exposure: 0.95, glowStrength: 0.45 },
+  { id: 4, name: "Chaos Inkstorm", trailDecay: 0.935, exposure: 1.25, glowStrength: 0.85 },
+];
+
+function createModule(device: GPUDevice) {
   return device.createShaderModule({ code: LIFELAB_WGSL });
 }
 
@@ -141,18 +241,16 @@ export function createLifelabSim(args: {
   numParticles?: number;
   speciesCount?: number;
 }): LifelabSim {
-  const {
-    device,
-    context,
-    format,
-    canvas,
-    seed = 1337,
-    numParticles = 20000,
-    speciesCount = 6,
-  } = args;
+  const { device, context, format, canvas } = args;
+  const seed = args.seed ?? 1337;
+  const numParticles = args.numParticles ?? 30_000;
+  const speciesCount = Math.max(2, Math.min(MAX_SPECIES, args.speciesCount ?? 6));
 
   const gridDim = 128;
   const cellCap = 16;
+
+  // NOTE: This project is WebGPU-only. We'll keep a simple trail buffer format.
+  const trailFormat: GPUTextureFormat = "rgba8unorm";
 
   const module = createModule(device);
 
@@ -162,17 +260,12 @@ export function createLifelabSim(args: {
 
   const particlesA = device.createBuffer({
     size: particleBytes,
-    usage:
-      GPUBufferUsage.STORAGE |
-      GPUBufferUsage.COPY_DST |
-      GPUBufferUsage.COPY_SRC,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
+
   const particlesB = device.createBuffer({
     size: particleBytes,
-    usage:
-      GPUBufferUsage.STORAGE |
-      GPUBufferUsage.COPY_DST |
-      GPUBufferUsage.COPY_SRC,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
 
   const paramsBuf = device.createBuffer({
@@ -183,7 +276,7 @@ export function createLifelabSim(args: {
   const cellCount = gridDim * gridDim;
   const cellCountsBuf = device.createBuffer({
     size: cellCount * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    usage: GPUBufferUsage.STORAGE,
   });
 
   const cellSlotsBuf = device.createBuffer({
@@ -201,15 +294,19 @@ export function createLifelabSim(args: {
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
+  const postParamsBuf = device.createBuffer({
+    size: 32,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
   // Seed initial data (D-0003)
   device.queue.writeBuffer(particlesA, 0, seedParticles(numParticles, speciesCount, seed));
-  device.queue.writeBuffer(interactionBuf, 0, createInteractionMatrix(seed));
-  device.queue.writeBuffer(paletteBuf, 0, makePalette(speciesCount));
+  device.queue.writeBuffer(particlesB, 0, seedParticles(numParticles, speciesCount, seed ^ 0xa5a5a5a5));
 
-  // Shared bind group layout for compute passes.
+  // ---- Bind group layouts (note: WGSL uses groups 0 (sim), 1 (particles render), 2 (post)) ----
   const simBGL = device.createBindGroupLayout({
     entries: [
-      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
@@ -218,22 +315,6 @@ export function createLifelabSim(args: {
     ],
   });
 
-  const simPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [simBGL] });
-
-  const csClear = device.createComputePipeline({
-    layout: simPipelineLayout,
-    compute: { module, entryPoint: "cs_clearCounts" },
-  });
-  const csBuild = device.createComputePipeline({
-    layout: simPipelineLayout,
-    compute: { module, entryPoint: "cs_buildGrid" },
-  });
-  const csSim = device.createComputePipeline({
-    layout: simPipelineLayout,
-    compute: { module, entryPoint: "cs_simulate" },
-  });
-
-  // Render pipeline
   const renderBGL = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
@@ -241,19 +322,45 @@ export function createLifelabSim(args: {
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
     ],
   });
-  const renderPipelineLayout = device.createPipelineLayout({
-    bindGroupLayouts: [renderBGL],
+
+  const postBGL = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+    ],
   });
 
-  const renderPipeline = device.createRenderPipeline({
-    layout: renderPipelineLayout,
+  // Unified pipeline layout (groups 0..2)
+  const unifiedLayout = device.createPipelineLayout({
+    bindGroupLayouts: [simBGL, renderBGL, postBGL],
+  });
+
+  // --- Compute pipelines ---
+  const csClear = device.createComputePipeline({
+    layout: unifiedLayout,
+    compute: { module, entryPoint: "cs_clearCounts" },
+  });
+  const csBuild = device.createComputePipeline({
+    layout: unifiedLayout,
+    compute: { module, entryPoint: "cs_buildGrid" },
+  });
+  const csSim = device.createComputePipeline({
+    layout: unifiedLayout,
+    compute: { module, entryPoint: "cs_simulate" },
+  });
+
+  // --- Particle render pipeline (writes into trail target) ---
+  const particlePipeline = device.createRenderPipeline({
+    layout: unifiedLayout,
     vertex: { module, entryPoint: "vs_particles" },
     fragment: {
       module,
       entryPoint: "fs_particles",
       targets: [
         {
-          format,
+          format: trailFormat,
           blend: {
             color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
             alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
@@ -263,74 +370,266 @@ export function createLifelabSim(args: {
     },
     primitive: { topology: "triangle-list", cullMode: "none" },
   });
-// Persistent bind groups (CR-0002 perf fix): avoid per-frame bind group allocation.
-const simBG_AB = device.createBindGroup({
-  layout: simBGL,
-  entries: [
-    { binding: 0, resource: { buffer: particlesA } },
-    { binding: 1, resource: { buffer: particlesB } },
-    { binding: 2, resource: { buffer: paramsBuf } },
-    { binding: 3, resource: { buffer: cellCountsBuf } },
-    { binding: 4, resource: { buffer: cellSlotsBuf } },
-    { binding: 5, resource: { buffer: interactionBuf } },
-  ],
-});
 
-const simBG_BA = device.createBindGroup({
-  layout: simBGL,
-  entries: [
-    { binding: 0, resource: { buffer: particlesB } },
-    { binding: 1, resource: { buffer: particlesA } },
-    { binding: 2, resource: { buffer: paramsBuf } },
-    { binding: 3, resource: { buffer: cellCountsBuf } },
-    { binding: 4, resource: { buffer: cellSlotsBuf } },
-    { binding: 5, resource: { buffer: interactionBuf } },
-  ],
-});
+  // --- Postprocess pipelines ---
+  const decayPipeline = device.createRenderPipeline({
+    layout: unifiedLayout,
+    vertex: { module, entryPoint: "vs_fullscreen" },
+    fragment: { module, entryPoint: "fs_decay", targets: [{ format: trailFormat }] },
+    primitive: { topology: "triangle-list", cullMode: "none" },
+  });
 
-const renderBG_A = device.createBindGroup({
-  layout: renderBGL,
-  entries: [
-    { binding: 0, resource: { buffer: particlesA } },
-    { binding: 1, resource: { buffer: paramsBuf } },
-    { binding: 2, resource: { buffer: paletteBuf } },
-  ],
-});
+  const glowPipeline = device.createRenderPipeline({
+    layout: unifiedLayout,
+    vertex: { module, entryPoint: "vs_fullscreen" },
+    fragment: { module, entryPoint: "fs_glow", targets: [{ format: trailFormat }] },
+    primitive: { topology: "triangle-list", cullMode: "none" },
+  });
 
-const renderBG_B = device.createBindGroup({
-  layout: renderBGL,
-  entries: [
-    { binding: 0, resource: { buffer: particlesB } },
-    { binding: 1, resource: { buffer: paramsBuf } },
-    { binding: 2, resource: { buffer: paletteBuf } },
-  ],
-});
+  const presentPipeline = device.createRenderPipeline({
+    layout: unifiedLayout,
+    vertex: { module, entryPoint: "vs_fullscreen" },
+    fragment: {
+      module,
+      entryPoint: "fs_present",
+      targets: [{ format }],
+    },
+    primitive: { topology: "triangle-list", cullMode: "none" },
+  });
 
-let pingAB = true;
-  let lastMs = performance.now();
-  let t = 0;
+  // Persistent sim bind groups (CR-0002 perf fix kept)
+  const simBG_AB = device.createBindGroup({
+    layout: simBGL,
+    entries: [
+      { binding: 0, resource: { buffer: particlesA } },
+      { binding: 1, resource: { buffer: particlesB } },
+      { binding: 2, resource: { buffer: paramsBuf } },
+      { binding: 3, resource: { buffer: cellCountsBuf } },
+      { binding: 4, resource: { buffer: cellSlotsBuf } },
+      { binding: 5, resource: { buffer: interactionBuf } },
+    ],
+  });
+
+  const simBG_BA = device.createBindGroup({
+    layout: simBGL,
+    entries: [
+      { binding: 0, resource: { buffer: particlesB } },
+      { binding: 1, resource: { buffer: particlesA } },
+      { binding: 2, resource: { buffer: paramsBuf } },
+      { binding: 3, resource: { buffer: cellCountsBuf } },
+      { binding: 4, resource: { buffer: cellSlotsBuf } },
+      { binding: 5, resource: { buffer: interactionBuf } },
+    ],
+  });
+
+  const renderBG_A = device.createBindGroup({
+    layout: renderBGL,
+    entries: [
+      { binding: 0, resource: { buffer: particlesA } },
+      { binding: 1, resource: { buffer: paramsBuf } },
+      { binding: 2, resource: { buffer: paletteBuf } },
+    ],
+  });
+
+  const renderBG_B = device.createBindGroup({
+    layout: renderBGL,
+    entries: [
+      { binding: 0, resource: { buffer: particlesB } },
+      { binding: 1, resource: { buffer: paramsBuf } },
+      { binding: 2, resource: { buffer: paletteBuf } },
+    ],
+  });
+
+  const sampler = device.createSampler({
+    magFilter: "linear",
+    minFilter: "linear",
+  });
+
+  // --- Trail + glow render targets (D-0005/D-0006) ---
+  let trailA: GPUTexture | null = null;
+  let trailB: GPUTexture | null = null;
+  let glowTex: GPUTexture | null = null;
+  let targetW = 0;
+  let targetH = 0;
+  let glowW = 0;
+  let glowH = 0;
+
+  let trailPing = true;
+
+  const makeTarget = (w: number, h: number) =>
+    device.createTexture({
+      size: { width: w, height: h },
+      format: trailFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+
+  function ensureTargets() {
+    const w = Math.max(1, canvas.width | 0);
+    const h = Math.max(1, canvas.height | 0);
+
+    if (w === targetW && h === targetH && trailA && trailB && glowTex) return;
+
+    targetW = w;
+    targetH = h;
+
+    // Glow at half res (clamped)
+    glowW = Math.max(1, (w / 2) | 0);
+    glowH = Math.max(1, (h / 2) | 0);
+
+    trailA?.destroy();
+    trailB?.destroy();
+    glowTex?.destroy();
+
+    trailA = makeTarget(w, h);
+    trailB = makeTarget(w, h);
+    glowTex = makeTarget(glowW, glowH);
+
+    // Reset trail ping to avoid reading destroyed textures
+    trailPing = true;
+
+    // Clear both trail targets once to avoid undefined contents
+    const encoder = device.createCommandEncoder();
+    for (const t of [trailA, trailB]) {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: t.createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+      });
+      pass.end();
+    }
+    device.queue.submit([encoder.finish()]);
+  }
+
+  function getTrailSrcDst() {
+    // Ping-pong between textures for decay (source) and accumulation (destination)
+    const src = trailPing ? trailA! : trailB!;
+    const dst = trailPing ? trailB! : trailA!;
+    return { src, dst };
+  }
+
+  // Post bind groups depend on textures, so recreate each frame if targets changed.
+  // We keep them cached per (src,dst).
+  let postBG_cacheKey = "";
+  let postBG: GPUBindGroup | null = null;
+  let postBG_forPresent_cacheKey = "";
+  let postBG_forPresent: GPUBindGroup | null = null;
+  let postBG_forGlow_cacheKey = "";
+  let postBG_forGlow: GPUBindGroup | null = null;
+
+  function makePostBG(trailView: GPUTextureView, auxView: GPUTextureView) {
+    return device.createBindGroup({
+      layout: postBGL,
+      entries: [
+        { binding: 0, resource: sampler },
+        { binding: 1, resource: trailView },
+        // binding(2) exists to keep a single post bind group layout across post passes.
+        // It is *not* the same as the render target for any given pass.
+        { binding: 2, resource: auxView },
+        { binding: 3, resource: { buffer: postParamsBuf } },
+      ],
+    });
+  }
+
+  // --- State ---
+  let pingAB = true;
+  let lastMs = 0;
+  let timeS = 0;
+  let presetId = 0;
+
+  // Apply initial preset
+  function applyPreset(id: number) {
+    presetId = Math.max(0, Math.min(PRESETS.length - 1, id));
+    device.queue.writeBuffer(interactionBuf, 0, createInteractionMatrix(seed, presetId));
+    device.queue.writeBuffer(paletteBuf, 0, makePalette(speciesCount, presetId));
+    // post params also updated in updatePostParams()
+    updatePostParams();
+  }
+
+  function updatePostParams() {
+    ensureTargets();
+    const p = PRESETS[presetId] ?? PRESETS[0]!;
+    device.queue.writeBuffer(
+      postParamsBuf,
+      0,
+      packPostParams({
+        resX: targetW,
+        resY: targetH,
+        glowResX: glowW,
+        glowResY: glowH,
+        trailDecay: p.trailDecay,
+        exposure: p.exposure,
+        glowStrength: p.glowStrength,
+      })
+    );
+
+    // Invalidate cached bind groups (textures might have changed)
+    postBG_cacheKey = "";
+    postBG_forGlow_cacheKey = "";
+    postBG_forPresent_cacheKey = "";
+  }
+
+  applyPreset(0);
 
   function updateParams(nowMs: number) {
-    const dt = Math.min(1 / 30, Math.max(1 / 240, (nowMs - lastMs) / 1000));
-    lastMs = nowMs;
-    t += dt;
+    ensureTargets();
 
-    const p = packParams({
-      resX: canvas.width,
-      resY: canvas.height,
-      time: t,
-      dt,
-      numParticles,
-      speciesCount,
-      gridDim,
-      cellCap,
-    });
-    device.queue.writeBuffer(paramsBuf, 0, p);
+    if (lastMs === 0) lastMs = nowMs;
+    const dtMs = Math.max(0, Math.min(50, nowMs - lastMs));
+    lastMs = nowMs;
+
+    const dt = Math.max(1 / 240, Math.min(1 / 30, dtMs / 1000));
+    timeS += dt;
+
+    device.queue.writeBuffer(
+      paramsBuf,
+      0,
+      packParams({
+        resX: targetW,
+        resY: targetH,
+        time: timeS,
+        dt,
+        numParticles,
+        speciesCount,
+        gridDim,
+        cellCap,
+      })
+    );
   }
 
   function stepAndRender(nowMs: number) {
-    updateParams(nowMs);    const simBG = pingAB ? simBG_AB : simBG_BA;
+    updateParams(nowMs);
+
+    const simBG = pingAB ? simBG_AB : simBG_BA;
     const rBG = pingAB ? renderBG_B : renderBG_A;
+
+    const { src: trailSrc, dst: trailDst } = getTrailSrcDst();
+    const trailSrcView = trailSrc.createView();
+    const trailDstView = trailDst.createView();
+    const glowView = glowTex!.createView();
+
+    // Cache post bind groups
+    const decayKey = `decay:${trailSrc.label ?? ""}:${trailPing}:${targetW}x${targetH}`;
+    if (!postBG || postBG_cacheKey !== decayKey) {
+      postBG_cacheKey = decayKey;
+      postBG = makePostBG(trailSrcView, trailSrcView);
+    }
+
+    const glowKey = `glow:${trailPing}:${targetW}x${targetH}->${glowW}x${glowH}`;
+    if (!postBG_forGlow || postBG_forGlow_cacheKey !== glowKey) {
+      postBG_forGlow_cacheKey = glowKey;
+      postBG_forGlow = makePostBG(trailDstView, trailDstView);
+    }
+
+    const presentKey = `present:${trailPing}:${targetW}x${targetH}->swap`;
+    if (!postBG_forPresent || postBG_forPresent_cacheKey !== presentKey) {
+      postBG_forPresent_cacheKey = presentKey;
+      postBG_forPresent = makePostBG(trailDstView, glowView);
+    }
 
     const encoder = device.createCommandEncoder();
 
@@ -340,7 +639,7 @@ let pingAB = true;
       pass.setBindGroup(0, simBG);
 
       pass.setPipeline(csClear);
-      pass.dispatchWorkgroups(Math.ceil((cellCount) / 256));
+      pass.dispatchWorkgroups(Math.ceil(cellCount / 256));
 
       pass.setPipeline(csBuild);
       pass.dispatchWorkgroups(Math.ceil(numParticles / 256));
@@ -351,33 +650,104 @@ let pingAB = true;
       pass.end();
     }
 
-    // Render
+    // D-0005: Trails
+    // Pass 1: decay previous trailSrc into trailDst
     {
-      const view = context.getCurrentTexture().createView();
       const pass = encoder.beginRenderPass({
         colorAttachments: [
           {
-            view,
-            clearValue: { r: 0.02, g: 0.02, b: 0.04, a: 1.0 },
+            view: trailDstView,
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
             loadOp: "clear",
             storeOp: "store",
           },
         ],
       });
 
-      pass.setPipeline(renderPipeline);
-      pass.setBindGroup(0, rBG);
+      pass.setPipeline(decayPipeline);
+      pass.setBindGroup(2, postBG!);
+      pass.draw(3);
+      pass.end();
+    }
+
+    // Pass 2: draw particles additively onto trailDst (accumulate ink)
+    {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: trailDstView,
+            loadOp: "load",
+            storeOp: "store",
+          },
+        ],
+      });
+
+      pass.setPipeline(particlePipeline);
+      pass.setBindGroup(1, rBG);
       pass.draw(numParticles * 6);
+      pass.end();
+    }
+
+    // D-0006: Glow (downsample + blur) into glowTex
+    {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: glowView,
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+      });
+
+      pass.setPipeline(glowPipeline);
+      pass.setBindGroup(2, postBG_forGlow!);
+      pass.draw(3);
+      pass.end();
+    }
+
+    // Present: composite trail + glow to swapchain
+    {
+      const view = context.getCurrentTexture().createView();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view,
+            clearValue: { r: 0.02, g: 0.02, b: 0.03, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+      });
+
+      pass.setPipeline(presentPipeline);
+      pass.setBindGroup(2, postBG_forPresent!);
+      pass.draw(3);
       pass.end();
     }
 
     device.queue.submit([encoder.finish()]);
 
+    // Flip
     pingAB = !pingAB;
+    trailPing = !trailPing;
 
-    return {
-      hud: `Seed ${seed} · N ${numParticles} · Species ${speciesCount} · Grid ${gridDim}×${gridDim} cap ${cellCap}`,
-    };
+    const p = PRESETS[presetId] ?? PRESETS[0]!;
+    const hud = `Preset: ${p.name} · Particles ${numParticles.toLocaleString()} · Species ${speciesCount} · ${targetW}×${targetH}`;
+    return { hud };
+  }
+
+  function setPreset(id: number) {
+    applyPreset(id);
+  }
+
+  function getPresets() {
+    return PRESETS.map((p) => ({ id: p.id, name: p.name }));
+  }
+
+  function getPreset() {
+    return presetId;
   }
 
   function destroy() {
@@ -388,7 +758,11 @@ let pingAB = true;
     cellSlotsBuf.destroy();
     interactionBuf.destroy();
     paletteBuf.destroy();
+    postParamsBuf.destroy();
+    trailA?.destroy();
+    trailB?.destroy();
+    glowTex?.destroy();
   }
 
-  return { stepAndRender, destroy };
+  return { stepAndRender, setPreset, getPresets, getPreset, destroy };
 }

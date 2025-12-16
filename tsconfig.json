@@ -18,6 +18,7 @@
     "noUncheckedIndexedAccess": true,
     "noFallthroughCasesInSwitch": true,
     "types": [
+      "vite/client",
       "@webgpu/types"
     ]
   },

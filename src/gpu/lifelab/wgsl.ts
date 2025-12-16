@@ -231,4 +231,94 @@ fn fs_particles(in: VSOut) -> @location(0) vec4f {
   return vec4f(col.rgb * glow, alpha * col.a);
 }
 
+
+// --- Postprocess (D-0005/D-0006): trails + glow + present ---
+struct PostParams {
+  res: vec2f,
+  glowRes: vec2f,
+  trailDecay: f32,
+  exposure: f32,
+  glowStrength: f32,
+  _pad: f32,
+};
+
+struct FSOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@group(2) @binding(0) var postSampler: sampler;
+@group(2) @binding(1) var trailTex: texture_2d<f32>;
+@group(2) @binding(2) var glowTex: texture_2d<f32>;
+@group(2) @binding(3) var<uniform> post: PostParams;
+
+@vertex
+fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> FSOut {
+  // Fullscreen triangle
+  var out: FSOut;
+
+  var p = vec2f(0.0, 0.0);
+  if (vid == 0u) { p = vec2f(-1.0, -1.0); }
+  if (vid == 1u) { p = vec2f( 3.0, -1.0); }
+  if (vid == 2u) { p = vec2f(-1.0,  3.0); }
+
+  out.pos = vec4f(p, 0.0, 1.0);
+  out.uv = (p + vec2f(1.0)) * 0.5;
+  return out;
+}
+
+fn tonemap(x: vec3f) -> vec3f {
+  // simple filmic-ish curve
+  let y = 1.0 - exp(-x * post.exposure);
+  return y;
+}
+
+@fragment
+fn fs_decay(in: FSOut) -> @location(0) vec4f {
+  // NOTE: We intentionally touch glowTex so all post passes share the same bind group layout.
+  let _unused = textureSample(glowTex, postSampler, vec2f(0.5, 0.5)).rgb;
+  let c = textureSample(trailTex, postSampler, in.uv);
+  // Multiply by decay < 1 to let trails fade like ink on paper.
+  return vec4f(c.rgb * post.trailDecay, 1.0);
+}
+
+@fragment
+fn fs_glow(in: FSOut) -> @location(0) vec4f {
+  // NOTE: We intentionally touch glowTex so all post passes share the same bind group layout.
+  let _unused = textureSample(glowTex, postSampler, vec2f(0.5, 0.5)).rgb;
+  // Cheap blur + implicit downsample (output surface is glowRes).
+  let uv = in.uv;
+
+  // 9 taps, fixed offsets in UV space relative to main resolution
+  let px = vec2f(1.0) / post.res;
+  var acc = vec3f(0.0);
+  acc += textureSample(trailTex, postSampler, uv).rgb * 0.28;
+  acc += textureSample(trailTex, postSampler, uv + vec2f( 1.0, 0.0) * px).rgb * 0.12;
+  acc += textureSample(trailTex, postSampler, uv + vec2f(-1.0, 0.0) * px).rgb * 0.12;
+  acc += textureSample(trailTex, postSampler, uv + vec2f(0.0,  1.0) * px).rgb * 0.12;
+  acc += textureSample(trailTex, postSampler, uv + vec2f(0.0, -1.0) * px).rgb * 0.12;
+  acc += textureSample(trailTex, postSampler, uv + vec2f( 1.0,  1.0) * px).rgb * 0.06;
+  acc += textureSample(trailTex, postSampler, uv + vec2f(-1.0,  1.0) * px).rgb * 0.06;
+  acc += textureSample(trailTex, postSampler, uv + vec2f( 1.0, -1.0) * px).rgb * 0.06;
+  acc += textureSample(trailTex, postSampler, uv + vec2f(-1.0, -1.0) * px).rgb * 0.06;
+
+  // Slightly emphasize brighter parts
+  let boosted = acc * acc;
+  return vec4f(boosted, 1.0);
+}
+
+@fragment
+fn fs_present(in: FSOut) -> @location(0) vec4f {
+  let base = textureSample(trailTex, postSampler, in.uv).rgb;
+  let g = textureSample(glowTex, postSampler, in.uv).rgb * post.glowStrength;
+
+  let c = tonemap(base + g);
+
+  // Gamma to display
+  let gamma = 1.0 / 2.2;
+  let out = pow(c, vec3f(gamma));
+
+  return vec4f(out, 1.0);
+}
+
 `;

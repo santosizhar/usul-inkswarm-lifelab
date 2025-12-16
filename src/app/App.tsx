@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { OverlayHud } from "../ui/OverlayHud";
+import { OverlayHud, type PresetInfo } from "../ui/OverlayHud";
 import { clamp } from "../ui/utils";
 import { FailScreen } from "./FailScreen";
 import { configureCanvas, initWebGPU } from "../gpu/webgpu";
@@ -12,6 +12,10 @@ type GpuState =
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const dpiRef = useRef<number>(1);
+  const simRef = useRef<LifelabSim | null>(null);
+
+  const [presets, setPresets] = useState<PresetInfo[]>([]);
+  const [presetId, setPresetId] = useState<number>(0);
 
   const [dpiScale, setDpiScale] = useState<number>(1);
   const [simHud, setSimHud] = useState<string>("");
@@ -29,7 +33,7 @@ export function App() {
       try {
         const { device, context, format } = await initWebGPU(canvas);
 
-        device.addEventListener("uncapturederror", (ev) => {
+        device.addEventListener("uncapturederror", (ev: GPUUncapturedErrorEvent) => {
           const msg =
             (ev.error && (ev.error as GPUError).message) || "Unknown GPU error";
           if (!alive) return;
@@ -40,7 +44,7 @@ export function App() {
           });
         });
 
-        device.lost.then((info) => {
+        device.lost.then((info: GPUDeviceLostInfo) => {
           if (!alive) return;
           setGpu({
             kind: "failed",
@@ -50,6 +54,9 @@ export function App() {
         });
 
         sim = createLifelabSim({ device, context, format, canvas });
+        simRef.current = sim;
+        setPresets(sim.getPresets());
+        setPresetId(sim.getPreset());
         const lastHudRef = { t: 0 };
 
         setGpu({ kind: "ready", detail: "WebGPU initialized" });
@@ -62,7 +69,7 @@ export function App() {
             dpiRef.current = dpr;
             setDpiScale(dpr);
           }
-          const { hud } = sim!.stepAndRender(performance.now());
+          const { hud } = simRef.current!.stepAndRender(performance.now());
           if (performance.now() - lastHudRef.t > 250) {
             lastHudRef.t = performance.now();
             setSimHud(hud);
@@ -87,7 +94,8 @@ raf = requestAnimationFrame(tick);
     return () => {
       alive = false;
       if (raf) cancelAnimationFrame(raf);
-      try { sim?.destroy(); } catch {}
+      try { sim?.destroy();
+      simRef.current = null; } catch {}
     };
   }, []);
 
@@ -111,7 +119,7 @@ raf = requestAnimationFrame(tick);
   return (
     <div className="app-root">
       <canvas ref={canvasRef} className="sim-canvas" />
-      <OverlayHud info={info} />
+      <OverlayHud info={info} presets={presets} presetId={presetId} onPreset={(id) => { simRef.current?.setPreset(id); setPresetId(id); }} />
       {gpu.kind === "failed" ? (
         <FailScreen
           info={{
